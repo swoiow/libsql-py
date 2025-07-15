@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = "0.19.0"
-libsql = { version = "0.9.10", features = ["encryption"]  }
+libsql = { git = "https://github.com/tursodatabase/libsql/", rev = "57043b60f3db38236187a8905bee62b35bf18afb", features = ["encryption"]  }
 tokio = { version = "1.29.1", features = [ "rt-multi-thread" ] }
 tracing-subscriber = "0.3"
 

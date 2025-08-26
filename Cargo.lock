@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "pylibsql"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "libsql",
  "pyo3",

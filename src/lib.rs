@@ -49,7 +49,7 @@ fn is_remote_path(path: &str) -> bool {
 
 #[pyfunction]
 #[cfg(not(Py_3_12))]
-#[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, auth_token="", encryption_key=None))]
+#[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None))]
 fn connect(
     py: Python<'_>,
     database: String,
@@ -59,6 +59,7 @@ fn connect(
     _uri: bool,
     sync_url: Option<String>,
     sync_interval: Option<f64>,
+    offline: bool,
     auth_token: &str,
     encryption_key: Option<String>,
 ) -> PyResult<Connection> {
@@ -71,6 +72,7 @@ fn connect(
         _uri,
         sync_url,
         sync_interval,
+        offline,
         auth_token,
         encryption_key,
     )?;
@@ -79,7 +81,7 @@ fn connect(
 
 #[pyfunction]
 #[cfg(Py_3_12)]
-#[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, auth_token="", encryption_key=None, autocommit = LEGACY_TRANSACTION_CONTROL))]
+#[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None, autocommit = LEGACY_TRANSACTION_CONTROL))]
 fn connect(
     py: Python<'_>,
     database: String,
@@ -89,6 +91,7 @@ fn connect(
     _uri: bool,
     sync_url: Option<String>,
     sync_interval: Option<f64>,
+    offline: bool,
     auth_token: &str,
     encryption_key: Option<String>,
     autocommit: i32,
@@ -102,6 +105,7 @@ fn connect(
         _uri,
         sync_url,
         sync_interval,
+        offline,
         auth_token,
         encryption_key,
     )?;
@@ -126,6 +130,7 @@ fn _connect_core(
     _uri: bool,
     sync_url: Option<String>,
     sync_interval: Option<f64>,
+    offline: bool,
     auth_token: &str,
     encryption_key: Option<String>,
 ) -> PyResult<Connection> {
@@ -147,17 +152,20 @@ fn _connect_core(
         match sync_url {
             Some(sync_url) => {
                 let sync_interval = sync_interval.map(|i| std::time::Duration::from_secs_f64(i));
-                let mut builder = libsql_core::Builder::new_remote_replica(
+                let mut builder = libsql_core::Builder::new_synced_database(
                     database,
                     sync_url,
                     auth_token.to_string(),
                 );
-                if let Some(encryption_config) = encryption_config {
-                    builder = builder.encryption_config(encryption_config);
+                if let Some(_) = encryption_config {
+                    return Err(PyValueError::new_err(
+                        "encryption is not supported for synced databases",
+                    ));
                 }
                 if let Some(sync_interval) = sync_interval {
                     builder = builder.sync_interval(sync_interval);
                 }
+                builder = builder.remote_writes(!offline);
                 let fut = builder.build();
                 tokio::pin!(fut);
                 let result = rt.block_on(check_signals(py, fut));

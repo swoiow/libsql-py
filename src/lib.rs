@@ -2,12 +2,24 @@ use ::libsql as libsql_core;
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
-use std::cell::{OnceCell, RefCell};
+use pyo3::types::{PyList, PyModule, PyTuple};
+use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 
 const LEGACY_TRANSACTION_CONTROL: i32 = -1;
+
+#[derive(Clone)]
+enum ListOrTuple<'py> {
+    List(Bound<'py, PyList>),
+    Tuple(Bound<'py, PyTuple>),
+}
+
+struct ListOrTupleIterator<'py> {
+    index: usize,
+    inner: ListOrTuple<'py>,
+}
 
 fn rt() -> Handle {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -25,7 +37,7 @@ fn rt() -> Handle {
 
 fn to_py_err(error: libsql_core::errors::Error) -> PyErr {
     let msg = match error {
-        libsql::Error::SqliteFailure(_, err) => err,
+        libsql_core::Error::SqliteFailure(_, err) => err,
         _ => error.to_string(),
     };
     PyValueError::new_err(msg)
@@ -37,26 +49,30 @@ fn is_remote_path(path: &str) -> bool {
 
 #[pyfunction]
 #[cfg(not(Py_3_12))]
-#[pyo3(signature = (database, isolation_level="DEFERRED".to_string(), check_same_thread=true, uri=false, sync_url=None, sync_interval=None, auth_token="", encryption_key=None))]
+#[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None))]
 fn connect(
     py: Python<'_>,
     database: String,
+    timeout: f64,
     isolation_level: Option<String>,
-    check_same_thread: bool,
-    uri: bool,
+    _check_same_thread: bool,
+    _uri: bool,
     sync_url: Option<String>,
     sync_interval: Option<f64>,
+    offline: bool,
     auth_token: &str,
     encryption_key: Option<String>,
 ) -> PyResult<Connection> {
     let conn = _connect_core(
         py,
         database,
+        timeout,
         isolation_level,
-        check_same_thread,
-        uri,
+        _check_same_thread,
+        _uri,
         sync_url,
         sync_interval,
+        offline,
         auth_token,
         encryption_key,
     )?;
@@ -65,15 +81,17 @@ fn connect(
 
 #[pyfunction]
 #[cfg(Py_3_12)]
-#[pyo3(signature = (database, isolation_level="DEFERRED".to_string(), check_same_thread=true, uri=false, sync_url=None, sync_interval=None, auth_token="", encryption_key=None, autocommit = LEGACY_TRANSACTION_CONTROL))]
+#[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None, autocommit = LEGACY_TRANSACTION_CONTROL))]
 fn connect(
     py: Python<'_>,
     database: String,
+    timeout: f64,
     isolation_level: Option<String>,
-    check_same_thread: bool,
-    uri: bool,
+    _check_same_thread: bool,
+    _uri: bool,
     sync_url: Option<String>,
     sync_interval: Option<f64>,
+    offline: bool,
     auth_token: &str,
     encryption_key: Option<String>,
     autocommit: i32,
@@ -81,11 +99,13 @@ fn connect(
     let mut conn = _connect_core(
         py,
         database,
+        timeout,
         isolation_level.clone(),
-        check_same_thread,
-        uri,
+        _check_same_thread,
+        _uri,
         sync_url,
         sync_interval,
+        offline,
         auth_token,
         encryption_key,
     )?;
@@ -104,11 +124,13 @@ fn connect(
 fn _connect_core(
     py: Python<'_>,
     database: String,
+    timeout: f64,
     isolation_level: Option<String>,
-    check_same_thread: bool,
-    uri: bool,
+    _check_same_thread: bool,
+    _uri: bool,
     sync_url: Option<String>,
     sync_interval: Option<f64>,
+    offline: bool,
     auth_token: &str,
     encryption_key: Option<String>,
 ) -> PyResult<Connection> {
@@ -117,34 +139,40 @@ fn _connect_core(
     let rt = rt();
     let encryption_config = match encryption_key {
         Some(key) => {
-            let cipher = libsql::Cipher::default();
-            let encryption_config = libsql::EncryptionConfig::new(cipher, key.into());
+            let cipher = libsql_core::Cipher::default();
+            let encryption_config = libsql_core::EncryptionConfig::new(cipher, key.into());
             Some(encryption_config)
         }
         None => None,
     };
     let db = if is_remote_path(&database) {
-        let result = libsql::Database::open_remote_internal(database.clone(), auth_token, ver);
+        let result = libsql_core::Database::open_remote_internal(database.clone(), auth_token, ver);
         result.map_err(to_py_err)?
     } else {
         match sync_url {
             Some(sync_url) => {
                 let sync_interval = sync_interval.map(|i| std::time::Duration::from_secs_f64(i));
-                let mut builder =
-                    libsql::Builder::new_remote_replica(database, sync_url, auth_token.to_string());
-                if let Some(encryption_config) = encryption_config {
-                    builder = builder.encryption_config(encryption_config);
+                let mut builder = libsql_core::Builder::new_synced_database(
+                    database,
+                    sync_url,
+                    auth_token.to_string(),
+                );
+                if let Some(_) = encryption_config {
+                    return Err(PyValueError::new_err(
+                        "encryption is not supported for synced databases",
+                    ));
                 }
                 if let Some(sync_interval) = sync_interval {
                     builder = builder.sync_interval(sync_interval);
                 }
+                builder = builder.remote_writes(!offline);
                 let fut = builder.build();
                 tokio::pin!(fut);
                 let result = rt.block_on(check_signals(py, fut));
                 result.map_err(to_py_err)?
             }
             None => {
-                let mut builder = libsql::Builder::new_local(database);
+                let mut builder = libsql_core::Builder::new_local(database);
                 if let Some(config) = encryption_config {
                     builder = builder.encryption_config(config);
                 }
@@ -158,6 +186,8 @@ fn _connect_core(
 
     let autocommit = isolation_level.is_none() as i32;
     let conn = db.connect().map_err(to_py_err)?;
+    let timeout = Duration::from_secs_f64(timeout);
+    conn.busy_timeout(timeout).map_err(to_py_err)?;
     Ok(Connection {
         db,
         conn: RefCell::new(Some(Arc::new(ConnectionGuard {
@@ -206,10 +236,11 @@ pub struct Connection {
 
 // SAFETY: The libsql crate guarantees that `Connection` is thread-safe.
 unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
 
 #[pymethods]
 impl Connection {
-    fn close(self_: PyRef<'_, Self>, py: Python<'_>) -> PyResult<()> {
+    fn close(self_: PyRef<'_, Self>, _py: Python<'_>) -> PyResult<()> {
         self_.conn.replace(None);
         Ok(())
     }
@@ -272,24 +303,26 @@ impl Connection {
         Ok(())
     }
 
+    #[pyo3(signature = (sql, parameters=None))]
     fn execute(
         self_: PyRef<'_, Self>,
         sql: String,
-        parameters: Option<&PyTuple>,
+        parameters: Option<ListOrTuple<'_>>,
     ) -> PyResult<Cursor> {
         let cursor = Connection::cursor(&self_)?;
         rt().block_on(async { execute(&cursor, sql, parameters).await })?;
         Ok(cursor)
     }
 
+    #[pyo3(signature = (sql, parameters=None))]
     fn executemany(
         self_: PyRef<'_, Self>,
         sql: String,
-        parameters: Option<&PyList>,
+        parameters: Option<&Bound<'_, PyList>>,
     ) -> PyResult<Cursor> {
         let cursor = Connection::cursor(&self_)?;
         for parameters in parameters.unwrap().iter() {
-            let parameters = parameters.extract::<&PyTuple>()?;
+            let parameters = parameters.extract::<ListOrTuple>()?;
             rt().block_on(async { execute(&cursor, sql.clone(), Some(parameters)).await })?;
         }
         Ok(cursor)
@@ -319,11 +352,12 @@ impl Connection {
     fn in_transaction(self_: PyRef<'_, Self>) -> PyResult<bool> {
         #[cfg(Py_3_12)]
         {
-            return Ok(
-                !self_.conn.borrow().as_ref().unwrap().is_autocommit() || self_.autocommit == 0
-            );
+            Ok(!self_.conn.borrow().as_ref().unwrap().is_autocommit() || self_.autocommit == 0)
         }
-        Ok(!self_.conn.borrow().as_ref().unwrap().is_autocommit())
+        #[cfg(not(Py_3_12))]
+        {
+            Ok(!self_.conn.borrow().as_ref().unwrap().is_autocommit())
+        }
     }
 
     #[getter]
@@ -343,6 +377,27 @@ impl Connection {
         self_.autocommit = autocommit;
         Ok(())
     }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        self_: PyRef<'_, Self>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        if exc_type.is_none() {
+            // Commit on clean exit
+            Connection::commit(self_)?;
+        } else {
+            // Rollback on error
+            Connection::rollback(self_)?;
+        }
+        Ok(false) // Always propagate exceptions
+    }
 }
 
 #[pyclass]
@@ -360,6 +415,7 @@ pub struct Cursor {
 
 // SAFETY: The libsql crate guarantees that `Connection` is thread-safe.
 unsafe impl Send for Cursor {}
+unsafe impl Sync for Cursor {}
 
 impl Drop for Cursor {
     fn drop(&mut self) {
@@ -382,22 +438,24 @@ impl Cursor {
         Ok(())
     }
 
+    #[pyo3(signature = (sql, parameters=None))]
     fn execute<'a>(
         self_: PyRef<'a, Self>,
         sql: String,
-        parameters: Option<&PyTuple>,
+        parameters: Option<ListOrTuple<'_>>,
     ) -> PyResult<pyo3::PyRef<'a, Self>> {
         rt().block_on(async { execute(&self_, sql, parameters).await })?;
         Ok(self_)
     }
 
+    #[pyo3(signature = (sql, parameters=None))]
     fn executemany<'a>(
         self_: PyRef<'a, Self>,
         sql: String,
-        parameters: Option<&PyList>,
+        parameters: Option<&Bound<'_, PyList>>,
     ) -> PyResult<pyo3::PyRef<'a, Cursor>> {
         for parameters in parameters.unwrap().iter() {
-            let parameters = parameters.extract::<&PyTuple>()?;
+            let parameters = parameters.extract::<ListOrTuple>()?;
             rt().block_on(async { execute(&self_, sql.clone(), Some(parameters)).await })?;
         }
         Ok(self_)
@@ -421,7 +479,7 @@ impl Cursor {
     }
 
     #[getter]
-    fn description(self_: PyRef<'_, Self>) -> PyResult<Option<&PyTuple>> {
+    fn description(self_: PyRef<'_, Self>) -> PyResult<Option<Bound<'_, PyTuple>>> {
         let stmt = self_.stmt.borrow();
         let mut elements: Vec<Py<PyAny>> = vec![];
         match stmt.as_ref() {
@@ -437,17 +495,18 @@ impl Cursor {
                         self_.py().None(),
                         self_.py().None(),
                     )
-                        .to_object(self_.py());
-                    elements.push(element);
+                        .into_pyobject(self_.py())
+                        .unwrap();
+                    elements.push(element.into());
                 }
-                let elements = PyTuple::new(self_.py(), elements);
+                let elements = PyTuple::new(self_.py(), elements)?;
                 Ok(Some(elements))
             }
             None => Ok(None),
         }
     }
 
-    fn fetchone(self_: PyRef<'_, Self>) -> PyResult<Option<&PyTuple>> {
+    fn fetchone(self_: PyRef<'_, Self>) -> PyResult<Option<Bound<'_, PyTuple>>> {
         let mut rows = self_.rows.borrow_mut();
         match rows.as_mut() {
             Some(rows) => {
@@ -464,7 +523,8 @@ impl Cursor {
         }
     }
 
-    fn fetchmany(self_: PyRef<'_, Self>, size: Option<i64>) -> PyResult<Option<&PyList>> {
+    #[pyo3(signature = (size=None))]
+    fn fetchmany(self_: PyRef<'_, Self>, size: Option<i64>) -> PyResult<Option<Bound<'_, PyList>>> {
         let mut rows = self_.rows.borrow_mut();
         match rows.as_mut() {
             Some(rows) => {
@@ -490,13 +550,13 @@ impl Cursor {
                         }
                     }
                 }
-                Ok(Some(PyList::new(self_.py(), elements)))
+                Ok(Some(PyList::new(self_.py(), elements)?))
             }
             None => Ok(None),
         }
     }
 
-    fn fetchall(self_: PyRef<'_, Self>) -> PyResult<Option<&PyList>> {
+    fn fetchall(self_: PyRef<'_, Self>) -> PyResult<Option<Bound<'_, PyList>>> {
         let mut rows = self_.rows.borrow_mut();
         match rows.as_mut() {
             Some(rows) => {
@@ -513,7 +573,7 @@ impl Cursor {
                         None => break,
                     }
                 }
-                Ok(Some(PyList::new(self_.py(), elements)))
+                Ok(Some(PyList::new(self_.py(), elements)?))
             }
             None => Ok(None),
         }
@@ -541,7 +601,11 @@ async fn begin_transaction(conn: &libsql_core::Connection) -> PyResult<()> {
     Ok(())
 }
 
-async fn execute(cursor: &Cursor, sql: String, parameters: Option<&PyTuple>) -> PyResult<()> {
+async fn execute<'py>(
+    cursor: &Cursor,
+    sql: String,
+    parameters: Option<ListOrTuple<'py>>,
+) -> PyResult<()> {
     if cursor.conn.borrow().as_ref().is_none() {
         return Err(PyValueError::new_err("Connection already closed"));
     }
@@ -565,7 +629,10 @@ async fn execute(cursor: &Cursor, sql: String, parameters: Option<&PyTuple>) -> 
                 } else if let Ok(value) = param.extract::<&[u8]>() {
                     libsql_core::Value::Blob(value.to_vec())
                 } else {
-                    return Err(PyValueError::new_err("Unsupported parameter type"));
+                    return Err(PyValueError::new_err(format!(
+                        "Unsupported parameter type {}",
+                        param.to_string()
+                    )));
                 };
                 params.push(param);
             }
@@ -618,32 +685,74 @@ fn stmt_is_dml(sql: &str) -> bool {
     sql.starts_with("INSERT") || sql.starts_with("UPDATE") || sql.starts_with("DELETE")
 }
 
-fn convert_row(py: Python, row: libsql_core::Row, column_count: i32) -> PyResult<&PyTuple> {
+fn convert_row(
+    py: Python,
+    row: libsql_core::Row,
+    column_count: i32,
+) -> PyResult<Bound<'_, PyTuple>> {
     let mut elements: Vec<Py<PyAny>> = vec![];
     for col_idx in 0..column_count {
         let libsql_value = row.get_value(col_idx).map_err(to_py_err)?;
         let value = match libsql_value {
             libsql_core::Value::Integer(v) => {
                 let value = v as i64;
-                value.into_py(py)
+                value.into_pyobject(py).unwrap().into()
             }
-            libsql_core::Value::Real(v) => v.into_py(py),
-            libsql_core::Value::Text(v) => v.into_py(py),
+            libsql_core::Value::Real(v) => v.into_pyobject(py).unwrap().into(),
+            libsql_core::Value::Text(v) => v.into_pyobject(py).unwrap().into(),
             libsql_core::Value::Blob(v) => {
                 let value = v.as_slice();
-                value.into_py(py)
+                value.into_pyobject(py).unwrap().into()
             }
             libsql_core::Value::Null => py.None(),
         };
         elements.push(value);
     }
-    Ok(PyTuple::new(py, elements))
+    Ok(PyTuple::new(py, elements)?)
 }
 
-create_exception!(libsql_experimental, Error, pyo3::exceptions::PyException);
+create_exception!(libsql, Error, pyo3::exceptions::PyException);
 
+impl<'py> FromPyObject<'py> for ListOrTuple<'py> {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(list) = ob.downcast::<PyList>() {
+            Ok(ListOrTuple::List(list.clone()))
+        } else if let Ok(tuple) = ob.downcast::<PyTuple>() {
+            Ok(ListOrTuple::Tuple(tuple.clone()))
+        } else {
+            Err(PyValueError::new_err(
+                "Expected a list or tuple for parameters",
+            ))
+        }
+    }
+}
+
+impl<'py> ListOrTuple<'py> {
+    pub fn iter(&self) -> ListOrTupleIterator<'py> {
+        ListOrTupleIterator {
+            index: 0,
+            inner: self.clone(),
+        }
+    }
+}
+
+impl<'py> Iterator for ListOrTupleIterator<'py> {
+    type Item = Bound<'py, PyAny>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rv = match &self.inner {
+            ListOrTuple::List(list) => list.get_item(self.index),
+            ListOrTuple::Tuple(tuple) => tuple.get_item(self.index),
+        };
+
+        rv.ok().map(|item| {
+            self.index += 1;
+            item
+        })
+    }
+}
 #[pymodule]
-fn libsql_experimental(py: Python, m: &PyModule) -> PyResult<()> {
+fn libsql(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt::try_init();
     m.add("LEGACY_TRANSACTION_CONTROL", LEGACY_TRANSACTION_CONTROL)?;
     m.add("paramstyle", "qmark")?;

@@ -3,8 +3,8 @@ requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "libsql-experimental"
-version = "0.0.53"
+name = "libsql"
+version = "0.1.10"
 requires-python = ">=3.7"
 classifiers = [
     "Programming Language :: Rust",
@@ -15,3 +15,4 @@ classifiers = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+module-name = "libsql"

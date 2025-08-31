@@ -1,19 +1,18 @@
 [package]
-name = "libsql-python"
-version = "0.0.53"
-edition = "2021"
+name = "pylibsql"
+version = "0.1.10"
+edition = "2024"
 
 [lib]
-name = "libsql_experimental"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.19.0"
-libsql = { version = "0.9.8", features = ["encryption"]  }
-tokio = { version = "1.29.1", features = [ "rt-multi-thread" ] }
-tracing-subscriber = "0.3"
+pyo3 = "0.25.1"
+libsql = { version = "0.9.21", features = ["encryption"]  }
+tokio = { version = "1.47.0", features = [ "rt-multi-thread" ] }
+tracing-subscriber = "0.3.19"
 
 [build-dependencies]
 version_check = "0.9.5"
 # used where logic has to be version/distribution specific, e.g. pypy
-pyo3-build-config = { version = "0.19.0" }
+pyo3-build-config = { version = "0.25.1" }

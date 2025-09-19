@@ -1,13 +1,13 @@
 [package]
 name = "pylibsql"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.26.0"
+pyo3 = "0.25.0"
 libsql = { version = "0.9.23", features = ["encryption"]  }
 tokio = { version = "1.47.1", features = [ "rt-multi-thread" ] }
 tracing-subscriber = "0.3.20"
@@ -15,4 +15,4 @@ tracing-subscriber = "0.3.20"
 [build-dependencies]
 version_check = "0.9.5"
 # used where logic has to be version/distribution specific, e.g. pypy
-pyo3-build-config = { version = "0.26.0" }
+pyo3-build-config = { version = "0.25.0" }

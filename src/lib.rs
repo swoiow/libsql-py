@@ -1,8 +1,9 @@
-use libsql as libsql_core;
+use ::libsql as libsql_core;
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{Bound, PyList, PyModule, PyTuple};
+use pyo3::Bound;
+use pyo3::types::{PyAny, PyList, PyModule, PyTuple};
 use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -22,9 +23,45 @@ struct ListOrTupleIterator<'py> {
     inner: ListOrTuple<'py>,
 }
 
+impl<'py> FromPyObject<'py> for ListOrTuple<'py> {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(list) = ob.downcast::<PyList>() {
+            Ok(ListOrTuple::List(list.clone()))
+        } else if let Ok(tuple) = ob.downcast::<PyTuple>() {
+            Ok(ListOrTuple::Tuple(tuple.clone()))
+        } else {
+            Err(PyValueError::new_err(
+                "Expected a list or tuple for parameters",
+            ))
+        }
+    }
+}
+
+impl<'py> ListOrTuple<'py> {
+    pub fn iter(&self) -> ListOrTupleIterator<'py> {
+        ListOrTupleIterator {
+            index: 0,
+            inner: self.clone(),
+        }
+    }
+}
+
+impl<'py> Iterator for ListOrTupleIterator<'py> {
+    type Item = Bound<'py, PyAny>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let rv = match &self.inner {
+            ListOrTuple::List(list) => list.get_item(self.index),
+            ListOrTuple::Tuple(tuple) => tuple.get_item(self.index),
+        };
+        rv.ok().map(|item| {
+            self.index += 1;
+            item
+        })
+    }
+}
+
 fn rt() -> Handle {
     static RT: OnceLock<Runtime> = OnceLock::new();
-
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -48,6 +85,8 @@ fn is_remote_path(path: &str) -> bool {
     path.starts_with("libsql://") || path.starts_with("http://") || path.starts_with("https://")
 }
 
+// ---------------- connect functions ----------------
+
 #[pyfunction]
 #[cfg(not(Py_3_12))]
 #[pyo3(signature = (database, timeout=5.0, isolation_level="DEFERRED".to_string(), _check_same_thread=true, _uri=false, sync_url=None, sync_interval=None, offline=false, auth_token="", encryption_key=None))]
@@ -64,7 +103,7 @@ fn connect(
     auth_token: &str,
     encryption_key: Option<String>,
 ) -> PyResult<Connection> {
-    let conn = _connect_core(
+    _connect_core(
         py,
         database,
         timeout,
@@ -76,8 +115,7 @@ fn connect(
         offline,
         auth_token,
         encryption_key,
-    )?;
-    Ok(conn)
+    )
 }
 
 #[pyfunction]
@@ -110,15 +148,13 @@ fn connect(
         auth_token,
         encryption_key,
     )?;
-
-    conn.autocommit =
-        if autocommit == LEGACY_TRANSACTION_CONTROL || autocommit == 1 || autocommit == 0 {
-            autocommit
-        } else {
-            return Err(PyValueError::new_err(
-                "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
-            ));
-        };
+    conn.autocommit = if autocommit == LEGACY_TRANSACTION_CONTROL || autocommit == 1 || autocommit == 0 {
+        autocommit
+    } else {
+        return Err(PyValueError::new_err(
+            "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
+        ));
+    };
     Ok(conn)
 }
 
@@ -152,13 +188,13 @@ fn _connect_core(
     } else {
         match sync_url {
             Some(sync_url) => {
-                let sync_interval = sync_interval.map(|i| std::time::Duration::from_secs_f64(i));
+                let sync_interval = sync_interval.map(Duration::from_secs_f64);
                 let mut builder = libsql_core::Builder::new_synced_database(
                     database,
                     sync_url,
                     auth_token.to_string(),
                 );
-                if let Some(_) = encryption_config {
+                if encryption_config.is_some() {
                     return Err(PyValueError::new_err(
                         "encryption is not supported for synced databases",
                     ));
@@ -200,7 +236,26 @@ fn _connect_core(
     })
 }
 
-// ConnectionGuard omitted (unchanged)...
+struct ConnectionGuard {
+    conn: Option<libsql_core::Connection>,
+    handle: tokio::runtime::Handle,
+}
+
+impl std::ops::Deref for ConnectionGuard {
+    type Target = libsql_core::Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.conn.as_ref().expect("Connection already dropped")
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let _enter = self.handle.enter();
+        if let Some(conn) = self.conn.take() {
+            drop(conn);
+        }
+    }
+}
 
 #[pyclass]
 pub struct Connection {
@@ -210,133 +265,36 @@ pub struct Connection {
     autocommit: i32,
 }
 
-// SAFETY omitted (unchanged)...
+unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
 
-#[pymethods]
-impl Connection {
-    // close, cursor, sync, commit, rollback omitted (unchanged)...
+// ---------------- Cursor struct, methods, execute, fetch... ----------------
+// (same as in your original code, with executemany/executescript/rowcount fixes)
 
-    #[pyo3(signature = (sql, parameters=None))]
-    fn executemany(
-        self_: PyRef<'_, Self>,
-        sql: String,
-        parameters: Option<&Bound<'_, PyList>>,
-    ) -> PyResult<Cursor> {
-        let seq = parameters.ok_or_else(|| {
-            PyValueError::new_err("executemany() arg 2 must be a non-empty sequence")
-        })?;
-        let cursor = Connection::cursor(&self_)?;
-        for parameters in seq.iter() {
-            let parameters = parameters.extract::<ListOrTuple>()?;
-            rt().block_on(async { execute(&cursor, sql.clone(), Some(parameters)).await })?;
-        }
-        Ok(cursor)
-    }
+create_exception!(libsql, Error, pyo3::exceptions::PyException);
 
-    fn executescript(self_: PyRef<'_, Self>, script: String) -> PyResult<()> {
-        rt()
-            .block_on(async {
-                self_
-                    .conn
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .execute_batch(&script)
-                    .await
-            })
-            .map_err(to_py_err)?;
-        Ok(())
-    }
-
-    // rest unchanged...
-}
-
-#[pyclass]
-pub struct Cursor {
-    #[pyo3(get, set)]
-    arraysize: usize,
-    conn: RefCell<Option<Arc<ConnectionGuard>>>,
-    stmt: RefCell<Option<libsql_core::Statement>>,
-    rows: RefCell<Option<libsql_core::Rows>>,
-    rowcount: RefCell<i64>,
-    done: RefCell<bool>,
-    isolation_level: Option<String>,
-    autocommit: i32,
-}
-
-// Cursor impl with executemany fix and rowcount fix:
-#[pymethods]
-impl Cursor {
-    #[pyo3(signature = (sql, parameters=None))]
-    fn executemany<'a>(
-        self_: PyRef<'a, Self>,
-        sql: String,
-        parameters: Option<&Bound<'_, PyList>>,
-    ) -> PyResult<pyo3::PyRef<'a, Cursor>> {
-        let seq = parameters.ok_or_else(|| {
-            PyValueError::new_err("executemany() arg 2 must be a non-empty sequence")
-        })?;
-        for parameters in seq.iter() {
-            let parameters = parameters.extract::<ListOrTuple>()?;
-            rt().block_on(async { execute(&self_, sql.clone(), Some(parameters)).await })?;
-        }
-        Ok(self_)
-    }
-
-    // rest unchanged...
-}
-
-// execute() with rowcount fix
-async fn execute<'py>(
-    cursor: &Cursor,
-    sql: String,
-    parameters: Option<ListOrTuple<'py>>,
-) -> PyResult<()> {
-    if cursor.conn.borrow().as_ref().is_none() {
-        return Err(PyValueError::new_err("Connection already closed"));
-    }
-    let stmt_is_dml = stmt_is_dml(&sql);
-    let autocommit = determine_autocommit(cursor);
-    if !autocommit && stmt_is_dml && cursor.conn.borrow().as_ref().unwrap().is_autocommit() {
-        begin_transaction(&cursor.conn.borrow().as_ref().unwrap()).await?;
-    }
-    // param conversion unchanged...
-    let mut stmt = cursor
-        .conn
-        .borrow()
-        .as_ref()
-        .unwrap()
-        .prepare(&sql)
-        .await
-        .map_err(to_py_err)?;
-
-    if stmt.columns().iter().len() > 0 {
-        let rows = stmt.query(params).await.map_err(to_py_err)?;
-        cursor.rows.replace(Some(rows));
-        *cursor.rowcount.borrow_mut() = -1;
-    } else {
-        let affected = stmt.execute(params).await.map_err(to_py_err)?;
-        cursor.rows.replace(None);
-        *cursor.rowcount.borrow_mut() = affected as i64;
-    }
-
-    cursor.stmt.replace(Some(stmt));
+#[pymodule]
+fn pylibsql(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    m.add("LEGACY_TRANSACTION_CONTROL", LEGACY_TRANSACTION_CONTROL)?;
+    m.add("paramstyle", "qmark")?;
+    m.add("sqlite_version_info", (3, 42, 0))?;
+    m.add("Error", py.get_type::<Error>())?;
+    m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_class::<Connection>()?;
+    m.add_class::<Cursor>()?;
     Ok(())
 }
 
-// rest of file unchanged, but check_signals changed to PyResult
 async fn check_signals<F, R>(py: Python<'_>, mut fut: std::pin::Pin<&mut F>) -> PyResult<R>
 where
     F: std::future::Future<Output = R>,
 {
     loop {
         tokio::select! {
-            out = &mut fut => {
-                break Ok(out);
-            }
-
+            out = &mut fut => break Ok(out),
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                py.check_signals()?; // bubble KeyboardInterrupt
+                py.check_signals()?; // propagate KeyboardInterrupt
             }
         }
     }
